@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/oxaxxaxaxaxaxaxxaaaxax/snake/internal/application/transport"
 	"github.com/oxaxxaxaxaxaxaxxaaaxax/snake/internal/domain"
 	pb "github.com/oxaxxaxaxaxaxaxxaaaxax/snake/proto"
 )
@@ -14,6 +15,7 @@ import (
 var (
 	ErrAvailableIdNotFound = errors.New("id not found")
 	ErrAddressNotFound     = errors.New("address not found")
+	ErrPlayerNotFound      = errors.New("player not found")
 )
 
 type Master struct {
@@ -72,17 +74,29 @@ func (m *Master) AddPlayer(address string, id int32) []domain.Player {
 	return m.Players
 }
 
-func (m *Master) SendJoinAck(receiveMsg *pb.GameMessage, address string) {
+func (m *Master) DeletePlayer(playerAddr string) ([]domain.Player, error) {
+	for idx, player := range m.Players {
+		if player.PlayerAddr == playerAddr {
+			m.Players[idx] = m.Players[len(m.Players)-1]
+			m.Players = m.Players[:len(m.Players)-1]
+			return m.Players, nil
+		}
+	}
+	return []domain.Player{}, ErrPlayerNotFound
+}
+
+func (m *Master) SendJoinAck(receiveMsg *pb.GameMessage, address string, peer *transport.PeerInfo) {
 	fmt.Println("role", receiveMsg.GetJoin().RequestedRole)
-	m.Engine.USock.SendAck(receiveMsg, address, m.Engine.GameCtx.PlayerID, m.PlayerCount)
+	m.Engine.USock.SendAck(receiveMsg, address, m.Engine.GameCtx.PlayerID, m.PlayerCount, peer)
 	m.Players = m.AddPlayer(address, m.PlayerCount)
+	m.Engine.Peers.PeersInfo[address] = peer
 	m.PlayerCount++
 }
 
-func (m *Master) SendPing() {
-	for _, player := range m.Players {
-		m.Engine.USock.SendPing(player.PlayerAddr, m.Engine.GameCtx.PlayerID)
-	}
+func (m *Master) SendPing(player domain.Player) {
+	//for _, player := range m.Players {
+	m.Engine.USock.SendPing(player.PlayerAddr, m.Engine.GameCtx.PlayerID, m.Engine.Peers.PeersInfo[player.PlayerAddr])
+	//}
 }
 
 func (m *Master) SetGameName() {
@@ -98,6 +112,7 @@ func (m *Master) SetGameContext() {
 	m.Engine.GameCtx.PlayerName = "master_name"
 	m.Engine.GameCtx.PlayerType = pb.PlayerType_HUMAN
 	m.Engine.GameCtx.Role = pb.NodeRole_MASTER
+	m.Engine.GameCtx.StateMsDelay = DefaultStateMsDelay
 }
 
 func (m *Master) SetGameConfig() {
@@ -146,7 +161,7 @@ func PlayersToProto(players []domain.Player) *pb.GamePlayers {
 	return protoPlayers
 }
 
-func (m *Master) SendAnnouncement(address string) {
+func (m *Master) SendAnnouncement(address string, peer *transport.PeerInfo) {
 	ctx := m.Engine.GameCtx
 
 	canJoin := true
@@ -159,7 +174,7 @@ func (m *Master) SendAnnouncement(address string) {
 		Players: PlayersToProto(m.Players),
 	}}
 	//fmt.Println("Send Announcement To Multicast from master")
-	err := m.Engine.USock.SendAnnouncement(address, ctx.PlayerID, announce)
+	err := m.Engine.USock.SendAnnouncement(address, ctx.PlayerID, announce, peer)
 	if err != nil {
 		fmt.Println("Err in SendAnnouncementToMulticast", err)
 	}
@@ -225,7 +240,8 @@ func (m *Master) GetAvailableId(playerCount int32) (int32, error) {
 func (m *Master) SelectNewDeputy() {
 	*m.Engine.GameCtx = m.ChangeDeputyInfo()
 	ctx := m.Engine.GameCtx
-	m.Engine.USock.SendRoleChange(ctx.DeputyInfo.DeputyAddr, ctx.PlayerID, pb.NodeRole_DEPUTY, pb.NodeRole_MASTER)
+	m.Engine.USock.SendRoleChange(ctx.DeputyInfo.DeputyAddr, ctx.PlayerID, pb.NodeRole_DEPUTY, pb.NodeRole_MASTER,
+		m.Engine.Peers.PeersInfo[ctx.DeputyInfo.DeputyAddr])
 }
 
 func (m *Master) DeputyToMaster() {
@@ -233,26 +249,31 @@ func (m *Master) DeputyToMaster() {
 	ctx := m.Engine.GameCtx
 	for _, player := range m.Players {
 		if player.PlayerId == ctx.DeputyInfo.DeputyId {
-			m.Engine.USock.SendRoleChange(ctx.DeputyInfo.DeputyAddr, ctx.PlayerID, pb.NodeRole_DEPUTY, pb.NodeRole_MASTER)
+			m.Engine.USock.SendRoleChange(ctx.DeputyInfo.DeputyAddr, ctx.PlayerID, pb.NodeRole_DEPUTY,
+				pb.NodeRole_MASTER, m.Engine.Peers.PeersInfo[player.PlayerAddr])
 		} else {
-			m.Engine.USock.SendRoleChange(player.PlayerAddr, m.Engine.GameCtx.PlayerID, pb.NodeRole_NORMAL, pb.NodeRole_MASTER)
+			m.Engine.USock.SendRoleChange(player.PlayerAddr, m.Engine.GameCtx.PlayerID, pb.NodeRole_NORMAL,
+				pb.NodeRole_MASTER, m.Engine.Peers.PeersInfo[player.PlayerAddr])
 		}
 	}
 }
 
-func (m *Master) NotifyDeadPlayer(id int32) {
+func (m *Master) NotifyDeadPlayer(id int32, peerInfo *transport.PeerInfo) {
 	ctx := m.Engine.GameCtx
-	player := m.Players[id]
-	m.Engine.USock.SendRoleChange(player.PlayerAddr, ctx.PlayerID, pb.NodeRole_VIEWER, pb.NodeRole_MASTER)
+	playerAddr, err := m.GetPlayerAddrById(id)
+	if err != nil {
+		fmt.Println(err)
+	}
+	m.Engine.USock.SendRoleChange(playerAddr, ctx.PlayerID, pb.NodeRole_VIEWER, pb.NodeRole_MASTER, peerInfo)
 }
 
-func (m *Master) LeaveMaster() {
+func (m *Master) LeaveMaster(peerInfo *transport.PeerInfo) {
 	ctx := m.Engine.GameCtx
 	viewer := NewViewer(m.Engine)
-	viewer.MasterToViewer(ctx.DeputyInfo.DeputyAddr)
+	viewer.MasterToViewer(ctx.DeputyInfo.DeputyAddr, peerInfo)
 }
 
-func (m *Master) HandleRoleChange(senderRole, receiverRole pb.NodeRole) RolePlayer {
+func (m *Master) HandleRoleChange(senderRole, receiverRole pb.NodeRole, peerInfo *transport.PeerInfo) RolePlayer {
 	//пока что я вижу тут только один случай - от осознанно выхдящего игрока
 	switch senderRole {
 	case pb.NodeRole_VIEWER:
@@ -284,4 +305,84 @@ func (m *Master) Start() {
 			m.SendAnnouncementToMulticast()
 		}
 	}
+}
+
+func (m *Master) StartNetTicker() {
+	interval := m.Engine.GameCtx.StateMsDelay / 10
+	recvInterval := interval * 8
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.CheckTimeoutInteraction(interval, recvInterval)
+		}
+	}
+}
+
+func (m *Master) CheckTimeoutInteraction(interval, recvInterval int32) {
+	//fmt.Println("Check Timeout Interaction")
+	for _, player := range m.Players {
+		//ДОБАВИТЬ ИНИЦИАЛИЗАЦИЮ МАСТЕР ИНФОР У МАСТЕРА(или не добавлять)
+		if player.PlayerAddr == m.Engine.GameCtx.MasterInfo.MasterAddr {
+			continue
+		}
+		peerInfo := m.Engine.Peers.PeersInfo[player.PlayerAddr]
+
+		if peerInfo == nil {
+			fmt.Println("Peer is nil!!", player.PlayerAddr)
+			continue
+		}
+		if peerInfo.LastSend.IsZero() {
+			continue
+		}
+		if time.Now().Sub(peerInfo.LastSend) >= time.Duration(interval)*time.Millisecond {
+			fmt.Println("Player send timeout - SEND PING")
+			m.SendPing(player)
+		}
+	}
+
+	for _, player := range m.Players {
+		peerInfo := m.Engine.Peers.PeersInfo[player.PlayerAddr]
+		if peerInfo == nil {
+			continue
+		}
+		acks := peerInfo.Acknowledges.Acks
+		for _, ack := range acks {
+			if ack.SendTime.IsZero() {
+				continue
+			}
+			if time.Now().Sub(ack.SendTime) >= time.Duration(interval)*time.Millisecond {
+				fmt.Println("Player ack timeout - RETRY")
+				m.Engine.USock.SendMessage(ack.RequestMsg, player.PlayerAddr, peerInfo)
+			}
+		}
+	}
+
+	for _, player := range m.Players {
+		peerInfo := m.Engine.Peers.PeersInfo[player.PlayerAddr]
+		if peerInfo == nil {
+			continue
+		}
+		if peerInfo.LastRecv.IsZero() {
+			continue
+		}
+		if time.Now().Sub(peerInfo.LastRecv) >= time.Duration(recvInterval)*time.Millisecond {
+			fmt.Println("Player recieve timeout - DISCONNECT", player.PlayerAddr)
+			switch player.Role {
+			case pb.NodeRole_DEPUTY:
+				m.SelectNewDeputy()
+			case pb.NodeRole_NORMAL:
+				//m.NotifyDeadPlayer(player.PlayerId, m.Engine.Peers.PeersInfo[player.PlayerAddr])
+				m.CreateZombieSnake()
+			}
+			players, err := m.DeletePlayer(player.PlayerAddr)
+			if err != nil {
+				fmt.Println("Delete player error", err)
+			}
+			m.Players = players
+		}
+	}
+
 }

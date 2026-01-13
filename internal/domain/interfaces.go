@@ -26,6 +26,8 @@ type GameCtx struct {
 	GameName   string
 	MasterInfo MasterInfo
 	DeputyInfo DeputyInfo
+
+	StateMsDelay int32
 }
 type MasterInfo struct {
 	MasterId   int32
