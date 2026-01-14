@@ -12,6 +12,8 @@ import (
 	pb "github.com/oxaxxaxaxaxaxaxxaaaxax/snake/proto"
 )
 
+const EmptyAddress string = ""
+
 var (
 	ErrAvailableIdNotFound = errors.New("id not found")
 	ErrAddressNotFound     = errors.New("address not found")
@@ -67,10 +69,13 @@ func (m *Master) SetId(id int32) {
 }
 
 func (m *Master) AddPlayer(address string, id int32) []domain.Player {
+	fmt.Println("add player, dep id:", m.Engine.GameCtx.DeputyInfo.DeputyId)
+
 	m.Players = append(m.Players, domain.Player{
 		PlayerId:   id,
 		PlayerAddr: address,
 	})
+
 	return m.Players
 }
 
@@ -85,12 +90,28 @@ func (m *Master) DeletePlayer(playerAddr string) ([]domain.Player, error) {
 	return []domain.Player{}, ErrPlayerNotFound
 }
 
+func (m *Master) Contains(playerAddr string) bool {
+	for _, player := range m.Players {
+		if player.PlayerAddr == playerAddr {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Master) SendJoinAck(receiveMsg *pb.GameMessage, address string, peer *transport.PeerInfo) {
 	fmt.Println("role", receiveMsg.GetJoin().RequestedRole)
 	m.Engine.USock.SendAck(receiveMsg, address, m.Engine.GameCtx.PlayerID, m.PlayerCount, peer)
 	m.Players = m.AddPlayer(address, m.PlayerCount)
-	m.Engine.Peers.PeersInfo[address] = peer
 	m.PlayerCount++
+
+	if m.Engine.GameCtx.DeputyInfo.DeputyId == UninitializedId {
+		fmt.Println("create new deputy!", m.Engine.GameCtx.DeputyInfo)
+		m.SelectNewDeputy()
+		fmt.Println("add new deputy!", m.Engine.GameCtx.DeputyInfo)
+	}
+
+	m.Engine.Peers.PeersInfo[address] = peer
 }
 
 func (m *Master) SendPing(player domain.Player) {
@@ -108,6 +129,8 @@ func (m *Master) SetGameName() {
 
 func (m *Master) SetGameContext() {
 	m.Engine.GameCtx = &domain.GameCtx{}
+	m.Engine.GameCtx.DeputyInfo.DeputyId = UninitializedId
+	fmt.Println(m.Engine.GameCtx.DeputyInfo)
 	m.Engine.GameCtx.PlayerID = m.Players[0].PlayerId
 	m.Engine.GameCtx.PlayerName = "master_name"
 	m.Engine.GameCtx.PlayerType = pb.PlayerType_HUMAN
@@ -208,24 +231,24 @@ func (m *Master) GetPlayerAddrById(id int32) (string, error) {
 	return "", ErrAddressNotFound
 }
 
-func (m *Master) ChangeDeputyInfo() domain.GameCtx {
+func (m *Master) ChangeDeputyInfo() (domain.DeputyInfo, error) {
 	ctx := m.Engine.GameCtx
 
 	//newDeputyId := m.Rand.GetRandomId(m.PlayerCount)
 	newDeputyId, err := m.GetAvailableId(m.PlayerCount)
 	if err != nil {
 		fmt.Println(err)
-		return domain.GameCtx{}
+		return domain.DeputyInfo{}, err
 	}
 	ctx.DeputyInfo.DeputyId = newDeputyId
 
 	newDeputyAddr, err := m.GetPlayerAddrById(newDeputyId)
 	if err != nil {
 		fmt.Println(err)
-		return domain.GameCtx{}
+		return domain.DeputyInfo{}, err
 	}
 	ctx.DeputyInfo.DeputyAddr = newDeputyAddr
-	return *ctx
+	return ctx.DeputyInfo, nil
 }
 
 func (m *Master) GetAvailableId(playerCount int32) (int32, error) {
@@ -238,14 +261,38 @@ func (m *Master) GetAvailableId(playerCount int32) (int32, error) {
 }
 
 func (m *Master) SelectNewDeputy() {
-	*m.Engine.GameCtx = m.ChangeDeputyInfo()
+	var err error
+	m.Engine.GameCtx.DeputyInfo, err = m.ChangeDeputyInfo()
+	if err != nil {
+		fmt.Println("No available players for deputy(just 1 master)")
+		return
+	}
 	ctx := m.Engine.GameCtx
 	m.Engine.USock.SendRoleChange(ctx.DeputyInfo.DeputyAddr, ctx.PlayerID, pb.NodeRole_DEPUTY, pb.NodeRole_MASTER,
 		m.Engine.Peers.PeersInfo[ctx.DeputyInfo.DeputyAddr])
 }
 
-func (m *Master) DeputyToMaster() {
-	*m.Engine.GameCtx = m.ChangeDeputyInfo()
+func (m *Master) DeputyToMaster() RolePlayer {
+	var err error
+
+	fmt.Println("DEPUTY TO MASTER")
+
+	m.Engine.GameCtx.DeputyInfo, err = m.ChangeDeputyInfo()
+	if err != nil {
+		fmt.Println("No available players for deputy(just 1 master)")
+		//fmt.Println(m.Engine.GameCtx.DeputyInfo.DeputyId, m.Engine.GameCtx.DeputyInfo.DeputyAddr)
+		//m.Engine.GameCtx.MasterInfo.MasterId = m.Engine.GameCtx.DeputyInfo.DeputyId
+		//m.Engine.GameCtx.MasterInfo.MasterAddr = m.Engine.GameCtx.DeputyInfo.DeputyAddr
+		//m.Engine.GameCtx.MasterInfo.MasterId = UninitializedId
+		//m.Engine.GameCtx.MasterInfo.MasterAddr = EmptyAddress
+		m.Engine.Peers.PeersInfo[m.Engine.GameCtx.MasterInfo.MasterAddr].Dead = true
+
+		return m
+
+	}
+	//Я не знаю насколько это нормально
+	m.Engine.GameCtx.MasterInfo.MasterId = m.Engine.GameCtx.DeputyInfo.DeputyId
+	m.Engine.GameCtx.MasterInfo.MasterAddr = m.Engine.GameCtx.DeputyInfo.DeputyAddr
 	ctx := m.Engine.GameCtx
 	for _, player := range m.Players {
 		if player.PlayerId == ctx.DeputyInfo.DeputyId {
@@ -256,6 +303,7 @@ func (m *Master) DeputyToMaster() {
 				pb.NodeRole_MASTER, m.Engine.Peers.PeersInfo[player.PlayerAddr])
 		}
 	}
+	return m
 }
 
 func (m *Master) NotifyDeadPlayer(id int32, peerInfo *transport.PeerInfo) {
@@ -321,7 +369,7 @@ func (m *Master) StartNetTicker() {
 	}
 }
 
-func (m *Master) CheckTimeoutInteraction(interval, recvInterval int32) {
+func (m *Master) CheckTimeoutInteraction(interval, recvInterval int32) RolePlayer {
 	//fmt.Println("Check Timeout Interaction")
 	for _, player := range m.Players {
 		//ДОБАВИТЬ ИНИЦИАЛИЗАЦИЮ МАСТЕР ИНФОР У МАСТЕРА(или не добавлять)
@@ -384,5 +432,5 @@ func (m *Master) CheckTimeoutInteraction(interval, recvInterval int32) {
 			m.Players = players
 		}
 	}
-
+	return m
 }

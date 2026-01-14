@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -13,10 +14,13 @@ import (
 
 const AssignedId = -1
 
+var ErrAddressIsEmpty = errors.New("address is empty")
+
 type PeerInfo struct {
 	Acknowledges *PendingAcks
 	LastRecv     time.Time
 	LastSend     time.Time
+	Dead         bool
 }
 
 type Peers struct {

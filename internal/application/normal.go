@@ -55,11 +55,11 @@ func (n *Normal) SendPingToMaster() {
 		n.Engine.Peers.PeersInfo[ctx.MasterInfo.MasterAddr])
 }
 
-func (n *Normal) ChangeMasterInfo() domain.GameCtx {
+func (n *Normal) ChangeMasterInfo() domain.MasterInfo {
 	ctx := n.Engine.GameCtx
 	ctx.MasterInfo.MasterId = ctx.DeputyInfo.DeputyId
 	ctx.MasterInfo.MasterAddr = ctx.DeputyInfo.DeputyAddr
-	return *ctx
+	return ctx.MasterInfo
 }
 
 func (n *Normal) BecomeViewer() {
@@ -82,12 +82,12 @@ func (n *Normal) HandleRoleChange(senderRole, receiverRole pb.NodeRole, peerInfo
 		case pb.NodeRole_NORMAL:
 			fmt.Println("New master!")
 			//о новом депути нормалы узнают из StateMsg
-			*n.Engine.GameCtx = n.ChangeMasterInfo()
+			n.Engine.GameCtx.MasterInfo = n.ChangeMasterInfo()
 			return n
 		//назначение кого-то заместителем (receiver_role = DEPUTY)
 		case pb.NodeRole_DEPUTY:
-			fmt.Println("You are new deputi!")
-			d := NewDeputy(n.Engine) //??? хз насколько это надо
+			fmt.Println("You are new deputy!")
+			d := NewDeputy(n.Engine) //??? хз насколько это надо upd14.01 - надо!
 			return d
 
 		}
@@ -118,14 +118,14 @@ func (n *Normal) StartNetTicker() {
 	}
 }
 
-func (n *Normal) CheckTimeoutInteraction(interval, recvInterval int32) {
+func (n *Normal) CheckTimeoutInteraction(interval, recvInterval int32) RolePlayer {
 	//fmt.Println("normal CheckTimeoutInteraction")
 	masterInfo := n.Engine.GameCtx.MasterInfo
 	peerInfo := n.Engine.Peers.PeersInfo[masterInfo.MasterAddr]
 
 	if peerInfo == nil {
 		fmt.Println("Master is nil")
-		return
+		return n
 	}
 	fmt.Println("Master not nil")
 	if !peerInfo.LastSend.IsZero() {
@@ -149,7 +149,8 @@ func (n *Normal) CheckTimeoutInteraction(interval, recvInterval int32) {
 	if !peerInfo.LastRecv.IsZero() {
 		if time.Now().Sub(peerInfo.LastRecv) >= time.Duration(recvInterval)*time.Millisecond {
 			fmt.Println("Master recieve timeout - DISCONNECT")
-			*n.Engine.GameCtx = n.ChangeMasterInfo()
+			n.Engine.GameCtx.MasterInfo = n.ChangeMasterInfo()
 		}
 	}
+	return n
 }

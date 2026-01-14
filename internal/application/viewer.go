@@ -28,11 +28,11 @@ func (v *Viewer) SetId(id int32) {
 	v.Engine.GameCtx.PlayerID = id
 }
 
-func (v *Viewer) ChangeMasterInfo() domain.GameCtx {
+func (v *Viewer) ChangeMasterInfo() domain.MasterInfo {
 	ctx := v.Engine.GameCtx
 	ctx.MasterInfo.MasterId = ctx.DeputyInfo.DeputyId
 	ctx.MasterInfo.MasterAddr = ctx.DeputyInfo.DeputyAddr
-	return *ctx
+	return ctx.MasterInfo
 }
 
 func (v *Viewer) AddMasterInfo(addr string, id int32) {
@@ -104,12 +104,12 @@ func (v *Viewer) SendPingToMaster() {
 		v.Engine.Peers.PeersInfo[ctx.MasterInfo.MasterAddr])
 }
 
-func (v *Viewer) CheckTimeoutInteraction(interval, recvInterval int32) {
+func (v *Viewer) CheckTimeoutInteraction(interval, recvInterval int32) RolePlayer {
 	masterInfo := v.Engine.GameCtx.MasterInfo
 	peerInfo := v.Engine.Peers.PeersInfo[masterInfo.MasterAddr]
 
 	if peerInfo == nil {
-		return
+		return v
 	}
 	if !peerInfo.LastSend.IsZero() {
 		if time.Now().Sub(peerInfo.LastSend) >= time.Duration(interval)*time.Millisecond {
@@ -132,7 +132,8 @@ func (v *Viewer) CheckTimeoutInteraction(interval, recvInterval int32) {
 	if !peerInfo.LastRecv.IsZero() {
 		if time.Now().Sub(peerInfo.LastRecv) >= time.Duration(recvInterval)*time.Millisecond {
 			fmt.Println("Master recieve timeout - DISCONNECT")
-			*v.Engine.GameCtx = v.ChangeMasterInfo()
+			v.Engine.GameCtx.MasterInfo = v.ChangeMasterInfo()
 		}
 	}
+	return v
 }

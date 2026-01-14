@@ -37,7 +37,7 @@ func (e *Engine) StartGame(player RolePlayer) {
 	e.Peers.PeersInfo = make(map[string]*transport.PeerInfo)
 	e.EventChan = make(chan domain.Event, 256)
 
-	e.GameCtx = &domain.GameCtx{}
+	//e.GameCtx = &domain.GameCtx{}
 	//e.GameCtx.PlayerID = UninitializedId
 
 	e.USock = transport.NewUnicastSocket()
@@ -49,12 +49,36 @@ func (e *Engine) StartGame(player RolePlayer) {
 	go e.MSock.ReadFromMulticastSocket(e.EventChan)
 
 	go player.Start()
-	go player.StartNetTicker()
+	//go player.StartNetTicker()
+	go e.StartNetTicker()
+
+	var err error
 
 	for {
 		ev := <-e.EventChan
-		fmt.Println("new event!")
-		HandleMessage(e.USock, ev, e.GameCtx, player, e.Peers)
+		//fmt.Println("new event!")
+		if ev.IsTick {
+			player = player.CheckTimeoutInteraction(ev.Interval, ev.RecvInterval)
+			continue
+		}
+		player, err = HandleMessage(e.USock, ev, e.GameCtx, player, e.Peers)
+		if err != nil {
+			fmt.Println("err in event loop!", err)
+		}
+	}
+}
+
+func (e *Engine) StartNetTicker() {
+	interval := e.GameCtx.StateMsDelay / 10
+	recvInterval := interval * 8
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			e.EventChan <- domain.Event{IsTick: true, Interval: interval, RecvInterval: recvInterval}
+		}
 	}
 }
 
@@ -116,11 +140,13 @@ func HandleAck(uSock transport.UnicastSocket, event domain.Event, senderId int32
 			v := player.(*Viewer)
 			v.AddMasterInfo(event.From, *event.GameMessage.SenderId)
 		default:
-			fmt.Println("Unknown player type!")
+			d := player.(*Deputy)
+			d.AddMasterInfo(event.From, *event.GameMessage.SenderId)
 		}
 
 		//сделать добавление пира
 		//???????????
+		//upd 14.01 чзх
 		return
 	}
 	//ackMsg, err := acks.GetPendingAckById(*event.GameMessage.SenderId)
@@ -190,6 +216,17 @@ func HandleJoin(uSock transport.UnicastSocket, event domain.Event,
 	senderId int32, player RolePlayer, peers *transport.Peers) {
 	fmt.Println("Receive Join")
 	m := player.(*Master)
+	if m.Contains(event.From) {
+		fmt.Println("This player exist!!")
+		peers.PeersInfo[event.From] = &transport.PeerInfo{
+			Acknowledges: &transport.PendingAcks{Acks: make(map[int64]*transport.PendingAckMsg)},
+			LastRecv:     time.Time{},
+			LastSend:     time.Time{},
+		}
+		m.Engine.USock.SendAck(event.GameMessage, event.From, transport.AssignedId, m.PlayerCount, peers.PeersInfo[event.From])
+		//m.SendJoinAck(event.GameMessage, event.From, peers.PeersInfo[event.From])
+		return
+	}
 	switch *event.GameMessage.GetJoin().RequestedRole {
 	case pb.NodeRole_NORMAL:
 		if !m.PlaceSnake() {
@@ -240,5 +277,5 @@ type RolePlayer interface {
 	SetId(id int32)
 	SetGameContext()
 	StartNetTicker()
-	CheckTimeoutInteraction(interval, recvInterval int32)
+	CheckTimeoutInteraction(interval, recvInterval int32) RolePlayer
 }

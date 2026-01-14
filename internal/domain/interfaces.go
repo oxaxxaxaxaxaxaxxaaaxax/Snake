@@ -14,7 +14,11 @@ const (
 type Event struct {
 	GameMessage *pb.GameMessage
 	From        string
-	Transport
+	Transport   Transport
+
+	IsTick       bool
+	Interval     int32
+	RecvInterval int32
 }
 
 type GameCtx struct {
