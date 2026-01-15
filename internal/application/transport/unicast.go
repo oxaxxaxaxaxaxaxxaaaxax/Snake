@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oxaxxaxaxaxaxaxxaaaxax/snake/internal/domain"
@@ -21,44 +23,46 @@ type PeerInfo struct {
 	LastRecv     time.Time
 	LastSend     time.Time
 	Dead         bool
+
+	M sync.Mutex
 }
 
 type Peers struct {
 	PeersInfo map[string]*PeerInfo
 }
 
-func (p *Peers) Get(addr string) *PeerInfo {
-	if p.PeersInfo == nil {
-		p.PeersInfo = make(map[string]*PeerInfo)
-	}
-
-	if p.PeersInfo[addr] == nil {
-		p.PeersInfo[addr] = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
-	}
-
-	return p.PeersInfo[addr]
-}
+//func (p *Peers) Get(addr string) *PeerInfo {
+//	if p.PeersInfo == nil {
+//		p.PeersInfo = make(map[string]*PeerInfo)
+//	}
+//
+//	if p.PeersInfo[addr] == nil {
+//		p.PeersInfo[addr] = &PeerInfo{
+//			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+//			LastRecv:     time.Time{},
+//			LastSend:     time.Time{},
+//		}
+//	}
+//
+//	return p.PeersInfo[addr]
+//}
 
 type UnicastSocket struct {
 	Conn net.PacketConn
-	Seq  int64
+	Seq  atomic.Int64
 }
 
-func NewUnicastSocket() UnicastSocket {
+func NewUnicastSocket() (UnicastSocket, error) {
 	conn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		fmt.Println("Error creating socket:", err)
-		return UnicastSocket{}
+		return UnicastSocket{}, err
 	}
 	fmt.Println("NewUnicastSocket created")
-	return UnicastSocket{Conn: conn}
+	return UnicastSocket{Conn: conn}, nil
 }
 
-func (u *UnicastSocket) ListenMessage(evChan chan domain.Event, peers *Peers) {
+func (u *UnicastSocket) ListenMessage(evChan chan domain.Event, peers *Peers, peerMtx *sync.Mutex) {
 	buf := make([]byte, 1024)
 
 	for {
@@ -70,17 +74,25 @@ func (u *UnicastSocket) ListenMessage(evChan chan domain.Event, peers *Peers) {
 		//peers.PeersInfo[addr.String()].LastRecv = time.Now()
 		//peer := peers.Get(addr.String())
 
+		//peerMtx.Lock()
+		//peer := peers.PeersInfo[addr.String()]
+		//if peer == nil {
+		//	peer = &PeerInfo{
+		//		Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//		LastRecv:     time.Time{},
+		//		LastSend:     time.Time{},
+		//	}
+		//	peers.PeersInfo[addr.String()] = peer
+		//}
+		//peerMtx.Unlock()
 		peer := peers.PeersInfo[addr.String()]
-
-		if peer == nil {
-			peer = &PeerInfo{
-				Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-				LastRecv:     time.Time{},
-				LastSend:     time.Time{},
-			}
+		if peer != nil {
+			fmt.Println("NOT DISCOVER/ANNOUNCE MSG")
+			peer.M.Lock()
+			peer.LastRecv = time.Now()
+			peer.M.Unlock()
 		}
 
-		peer.LastRecv = time.Now()
 		message := &pb.GameMessage{}
 
 		err = proto.Unmarshal(buf[:n], message)
@@ -89,7 +101,7 @@ func (u *UnicastSocket) ListenMessage(evChan chan domain.Event, peers *Peers) {
 			continue
 		}
 
-		fmt.Printf("recv n=%d from=%s first=% x\n", n, addr.String(), buf[:min(n, 16)])
+		//fmt.Printf("recv n=%d from=%s first=% x\n", n, addr.String(), buf[:min(n, 16)])
 		evChan <- domain.Event{
 			From:        addr.String(),
 			GameMessage: message,
@@ -98,7 +110,7 @@ func (u *UnicastSocket) ListenMessage(evChan chan domain.Event, peers *Peers) {
 	}
 }
 
-func (u *UnicastSocket) SendMessage(message []byte, address string, peer *PeerInfo) error {
+func (u *UnicastSocket) SendMessage(message []byte, address string, peer *PeerInfo, peerMtx *sync.Mutex) error {
 	recvAddr, err := net.ResolveUDPAddr("udp", address)
 	_, err = u.Conn.WriteTo(message, recvAddr)
 	if err != nil {
@@ -106,12 +118,17 @@ func (u *UnicastSocket) SendMessage(message []byte, address string, peer *PeerIn
 	}
 
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		fmt.Println("NIL")
 	}
+	//peerMtx.Lock()
+	//if peer == nil {
+	//	peer = &PeerInfo{
+	//		Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+	//		LastRecv:     time.Time{},
+	//		LastSend:     time.Time{},
+	//	}
+	//}
+	//peerMtx.Unlock()
 
 	gMsg := &pb.GameMessage{}
 	err = proto.Unmarshal(message, gMsg)
@@ -120,24 +137,30 @@ func (u *UnicastSocket) SendMessage(message []byte, address string, peer *PeerIn
 		return err
 	}
 
+	peer.M.Lock()
 	peer.LastSend = time.Now()
+	peer.M.Unlock()
 
 	switch gMsg.Type.(type) {
 	case *pb.GameMessage_Announcement, *pb.GameMessage_Discover, *pb.GameMessage_Ack:
 		return nil
 	default:
+		msgSeq := *gMsg.MsgSeq
+		peer.M.Lock()
 		peer.Acknowledges.AppendAcks(PendingAckMsg{
 			RequestMsg: message,
 			SendTime:   time.Now(),
-		}, u.Seq)
-		u.Seq++
+		}, msgSeq)
+		peer.M.Unlock()
 	}
 
 	return nil
 }
 
+//остановилась на сенд месандж
+
 func (u *UnicastSocket) SendAck(receiveMsg *pb.GameMessage, address string, senderId,
-	receiverId int32, peer *PeerInfo) error {
+	receiverId int32, peer *PeerInfo, peerMtx *sync.Mutex) error {
 	var msg []byte
 	var err error
 	if receiverId == AssignedId {
@@ -161,27 +184,35 @@ func (u *UnicastSocket) SendAck(receiveMsg *pb.GameMessage, address string, send
 		return err
 	}
 	recvAddr, err := net.ResolveUDPAddr("udp", address)
-	fmt.Println("Send Ack to", address)
+	fmt.Println("Send Ack to", address, receiverId)
 	_, err = u.Conn.WriteTo(msg, recvAddr)
 	if err != nil {
 		return err
 	}
 
+	//peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		//этот кейс должен быть недостижимым
+		fmt.Println("peer is nil (incorrect)")
+		//peerMtx.Unlock()
+		return nil
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
-
+	peer.M.Lock()
 	peer.LastSend = time.Now()
+	peer.M.Unlock()
+	//peerMtx.Unlock()
 	return nil
 }
 
-func (u *UnicastSocket) SendPing(address string, senderId int32, peer *PeerInfo) error {
+func (u *UnicastSocket) SendPing(address string, senderId int32, peer *PeerInfo, peerMtx *sync.Mutex) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type:     &pb.GameMessage_Ping{},
 	})
@@ -194,26 +225,34 @@ func (u *UnicastSocket) SendPing(address string, senderId int32, peer *PeerInfo)
 		return err
 	}
 
+	//peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		//этот кейс должен быть недостижимым
+		fmt.Println("peer is nil (incorrect)")
+		//peerMtx.Unlock()
+		return nil
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
-
+	peer.M.Lock()
 	peer.LastSend = time.Now()
 	peer.Acknowledges.AppendAcks(PendingAckMsg{
 		RequestMsg: msg,
 		SendTime:   time.Now(),
-	}, u.Seq)
-	u.Seq++
+	}, msgSeq)
+	peer.M.Unlock()
+	//peerMtx.Unlock()
 	return nil
 }
 
-func (u *UnicastSocket) SendSteer(address string, senderId int32, direction pb.Direction, peer *PeerInfo) error {
+func (u *UnicastSocket) SendSteer(address string, senderId int32, direction pb.Direction,
+	peer *PeerInfo, peerMtx *sync.Mutex) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type: &pb.GameMessage_Steer{
 			Steer: &pb.GameMessage_SteerMsg{
@@ -230,26 +269,34 @@ func (u *UnicastSocket) SendSteer(address string, senderId int32, direction pb.D
 		return err
 	}
 
+	//peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		//этот кейс должен быть недостижимым
+		fmt.Println("peer is nil (incorrect)")
+		//peerMtx.Unlock()
+		return nil
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
-
+	peer.M.Lock()
 	peer.LastSend = time.Now()
 	peer.Acknowledges.AppendAcks(PendingAckMsg{
 		RequestMsg: msg,
 		SendTime:   time.Now(),
-	}, u.Seq)
-	u.Seq++
+	}, msgSeq)
+	peer.M.Unlock()
+	//peerMtx.Unlock()
 	return nil
 }
 
-func (u *UnicastSocket) SendState(address string, senderId int32, state *pb.GameState, peer *PeerInfo) error {
+func (u *UnicastSocket) SendState(address string, senderId int32, state *pb.GameState,
+	peer *PeerInfo, peerMtx *sync.Mutex) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type: &pb.GameMessage_State{
 			State: &pb.GameMessage_StateMsg{
@@ -266,28 +313,35 @@ func (u *UnicastSocket) SendState(address string, senderId int32, state *pb.Game
 		return err
 	}
 
+	//peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		//этот кейс должен быть недостижимым
+		fmt.Println("peer is nil (incorrect)")
+		//peerMtx.Unlock()
+		return nil
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
-
+	peer.M.Lock()
 	peer.LastSend = time.Now()
 	peer.Acknowledges.AppendAcks(PendingAckMsg{
 		RequestMsg: msg,
 		SendTime:   time.Now(),
-	}, u.Seq)
-	u.Seq++
+	}, msgSeq)
+	peer.M.Unlock()
+	//peerMtx.Unlock()
 	return nil
 }
 
 func (u *UnicastSocket) SendAnnouncement(address string, senderId int32,
-	ann []*pb.GameAnnouncement, peer *PeerInfo) error {
+	ann []*pb.GameAnnouncement) error {
 	fmt.Println("address", address)
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type: &pb.GameMessage_Announcement{
 			Announcement: &pb.GameMessage_AnnouncementMsg{
@@ -304,23 +358,32 @@ func (u *UnicastSocket) SendAnnouncement(address string, senderId int32,
 		return err
 	}
 
-	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
-	}
+	//пиров нет в announcement
 
-	peer.LastSend = time.Now()
-	u.Seq++
+	//peerMtx.Lock()
+	//if peer == nil {
+	//	//этот кейс должен быть недостижимым
+	//	fmt.Println("peer is nil (incorrect)")
+	//	peerMtx.Unlock()
+	//	return nil
+	//	//peer = &PeerInfo{
+	//	//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+	//	//	LastRecv:     time.Time{},
+	//	//	LastSend:     time.Time{},
+	//	//}
+	//}
+	//peer.M.Lock()
+	//peer.LastSend = time.Now()
+	//peer.M.Unlock()
+	//peerMtx.Unlock()
 	return nil
 }
 
 func (u *UnicastSocket) SendAnnouncementToMulticast(senderId int32, ann []*pb.GameAnnouncement) error {
 	fmt.Println("ID Multicast from master", senderId)
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type: &pb.GameMessage_Announcement{
 			Announcement: &pb.GameMessage_AnnouncementMsg{
@@ -337,13 +400,13 @@ func (u *UnicastSocket) SendAnnouncementToMulticast(senderId int32, ann []*pb.Ga
 	if err != nil {
 		return err
 	}
-	u.Seq++
 	return nil
 }
 
 func (u *UnicastSocket) SendDiscover(senderId int32) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type:     &pb.GameMessage_Discover{},
 	})
@@ -363,13 +426,13 @@ func (u *UnicastSocket) SendDiscover(senderId int32) error {
 		return err
 	}
 	fmt.Println("Send Discover!")
-	u.Seq++
 	return nil
 }
 
-func (u *UnicastSocket) SendJoin(address string, ctx domain.GameCtx, peer *PeerInfo) error {
+func (u *UnicastSocket) SendJoin(address string, ctx domain.GameCtx, peer *PeerInfo, peerMtx *sync.Mutex) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &ctx.PlayerID,
 		Type: &pb.GameMessage_Join{
 			Join: &pb.GameMessage_JoinMsg{
@@ -389,26 +452,32 @@ func (u *UnicastSocket) SendJoin(address string, ctx domain.GameCtx, peer *PeerI
 		return err
 	}
 
+	peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		fmt.Println("peer is nil in join(incorrect)")
+		return nil
+		//fmt.Println("peer is nil (correct)")
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
+	fmt.Println("peer is not nil in join ")
 
 	peer.LastSend = time.Now()
 	peer.Acknowledges.AppendAcks(PendingAckMsg{
 		RequestMsg: msg,
 		SendTime:   time.Now(),
-	}, u.Seq)
-	u.Seq++
+	}, msgSeq)
+	peerMtx.Unlock()
 	return nil
 }
 
-func (u *UnicastSocket) SendError(address string, senderId int32, errorMsg string, peer *PeerInfo) error {
+func (u *UnicastSocket) SendError(address string, senderId int32, errorMsg string, peer *PeerInfo, peerMtx *sync.Mutex) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type: &pb.GameMessage_Error{
 			Error: &pb.GameMessage_ErrorMsg{
@@ -425,27 +494,36 @@ func (u *UnicastSocket) SendError(address string, senderId int32, errorMsg strin
 		return err
 	}
 
+	//peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		//этот кейс должен быть недостижимым
+		fmt.Println("peer is nil (incorrect)")
+		//peerMtx.Unlock()
+		return nil
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
-
+	//peerMtx.Unlock()
+	peer.M.Lock()
 	peer.LastSend = time.Now()
 	peer.Acknowledges.AppendAcks(PendingAckMsg{
 		RequestMsg: msg,
 		SendTime:   time.Now(),
-	}, u.Seq)
-	u.Seq++
+	}, msgSeq)
+	peer.M.Unlock()
+	//peerMtx.Unlock()
+
 	return nil
 }
 
 func (u *UnicastSocket) SendRoleChange(address string, senderId int32, recvRole,
-	sendRole pb.NodeRole, peer *PeerInfo) error {
+	sendRole pb.NodeRole, peer *PeerInfo, peerMtx *sync.Mutex) error {
+	msgSeq := u.Seq.Add(1) - 1
 	msg, err := proto.Marshal(&pb.GameMessage{
-		MsgSeq:   &u.Seq,
+		MsgSeq:   &msgSeq,
 		SenderId: &senderId,
 		Type: &pb.GameMessage_RoleChange{
 			RoleChange: &pb.GameMessage_RoleChangeMsg{
@@ -463,19 +541,25 @@ func (u *UnicastSocket) SendRoleChange(address string, senderId int32, recvRole,
 		return err
 	}
 
+	//peerMtx.Lock()
 	if peer == nil {
-		peer = &PeerInfo{
-			Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
-			LastRecv:     time.Time{},
-			LastSend:     time.Time{},
-		}
+		//этот кейс должен быть недостижимым
+		fmt.Println("peer is nil (incorrect)")
+		//peerMtx.Unlock()
+		return nil
+		//peer = &PeerInfo{
+		//	Acknowledges: &PendingAcks{Acks: make(map[int64]*PendingAckMsg)},
+		//	LastRecv:     time.Time{},
+		//	LastSend:     time.Time{},
+		//}
 	}
-
+	peer.M.Lock()
 	peer.LastSend = time.Now()
 	peer.Acknowledges.AppendAcks(PendingAckMsg{
 		RequestMsg: msg,
 		SendTime:   time.Now(),
-	}, u.Seq)
-	u.Seq++
+	}, msgSeq)
+	peer.M.Unlock()
+	//peerMtx.Unlock()
 	return nil
 }

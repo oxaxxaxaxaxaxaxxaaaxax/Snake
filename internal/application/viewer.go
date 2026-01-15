@@ -12,8 +12,8 @@ import (
 type Viewer struct {
 	Engine *Engine
 
-	lastSend time.Time
-	lastRecv time.Time
+	//lastSend time.Time
+	//lastRecv time.Time
 }
 
 func NewViewer(e *Engine) *Viewer {
@@ -25,10 +25,14 @@ func (v *Viewer) SetEngine(e *Engine) {
 }
 
 func (v *Viewer) SetId(id int32) {
+	v.Engine.GameMtx.Lock()
 	v.Engine.GameCtx.PlayerID = id
+	v.Engine.GameMtx.Unlock()
 }
 
 func (v *Viewer) ChangeMasterInfo() domain.MasterInfo {
+	v.Engine.GameMtx.Lock()
+	defer v.Engine.GameMtx.Unlock()
 	ctx := v.Engine.GameCtx
 	ctx.MasterInfo.MasterId = ctx.DeputyInfo.DeputyId
 	ctx.MasterInfo.MasterAddr = ctx.DeputyInfo.DeputyAddr
@@ -36,26 +40,47 @@ func (v *Viewer) ChangeMasterInfo() domain.MasterInfo {
 }
 
 func (v *Viewer) AddMasterInfo(addr string, id int32) {
-	v.Engine.Peers.PeersInfo[addr] = &transport.PeerInfo{
-		Acknowledges: &transport.PendingAcks{Acks: make(map[int64]*transport.PendingAckMsg)},
-		LastRecv:     time.Time{},
-		LastSend:     time.Time{},
-	}
+	//недостижимый кейс
+	//v.Engine.Peers.PeersInfo[addr] = &transport.PeerInfo{
+	//	Acknowledges: &transport.PendingAcks{Acks: make(map[int64]*transport.PendingAckMsg)},
+	//	LastRecv:     time.Time{},
+	//	LastSend:     time.Time{},
+	//}
+	v.Engine.GameMtx.Lock()
 	v.Engine.GameCtx.MasterInfo = domain.MasterInfo{
 		MasterAddr: addr,
 		MasterId:   id,
 	}
+	v.Engine.GameMtx.Unlock()
 }
 
 func (v *Viewer) LeaveGame() {
-	ctx := v.Engine.GameCtx
-	v.Engine.USock.SendRoleChange(ctx.MasterInfo.MasterAddr, ctx.PlayerID, pb.NodeRole_MASTER,
-		pb.NodeRole_VIEWER, v.Engine.Peers.PeersInfo[ctx.MasterInfo.MasterAddr])
+	v.Engine.GameMtx.Lock()
+	masterAddr := v.Engine.GameCtx.MasterInfo.MasterAddr
+	senderId := v.Engine.GameCtx.PlayerID
+	v.Engine.GameMtx.Unlock()
+
+	v.Engine.PeerMtx.Lock()
+	peerInfo := v.Engine.Peers.PeersInfo[masterAddr]
+	v.Engine.PeerMtx.Unlock()
+
+	err := v.Engine.USock.SendRoleChange(masterAddr, senderId, pb.NodeRole_MASTER,
+		pb.NodeRole_VIEWER, peerInfo, &v.Engine.PeerMtx)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
 func (v *Viewer) MasterToViewer(newMasterAddr string, peerInfo *transport.PeerInfo) {
-	ctx := v.Engine.GameCtx
-	v.Engine.USock.SendRoleChange(newMasterAddr, ctx.PlayerID, pb.NodeRole_MASTER, pb.NodeRole_VIEWER, peerInfo)
+	v.Engine.GameMtx.Lock()
+	senderId := v.Engine.GameCtx.PlayerID
+	v.Engine.GameMtx.Unlock()
+
+	err := v.Engine.USock.SendRoleChange(newMasterAddr, senderId, pb.NodeRole_MASTER,
+		pb.NodeRole_VIEWER, peerInfo, &v.Engine.PeerMtx)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
 func (v *Viewer) Watch() {
@@ -68,12 +93,14 @@ func (v *Viewer) HandleRoleChange(senderRole, receiverRole pb.NodeRole, peerInfo
 }
 
 func (v *Viewer) SetGameContext() {
+	v.Engine.GameMtx.Lock()
 	v.Engine.GameCtx = &domain.GameCtx{}
 	v.Engine.GameCtx.PlayerID = UninitializedId
 	v.Engine.GameCtx.PlayerName = "viewer_name"
 	v.Engine.GameCtx.PlayerType = pb.PlayerType_HUMAN
 	v.Engine.GameCtx.Role = pb.NodeRole_VIEWER
 	v.Engine.GameCtx.StateMsDelay = DefaultStateMsDelay
+	v.Engine.GameMtx.Unlock()
 }
 
 func (v *Viewer) Start() {
@@ -99,40 +126,84 @@ func (v *Viewer) StartNetTicker() {
 }
 
 func (v *Viewer) SendPingToMaster() {
-	ctx := v.Engine.GameCtx
-	v.Engine.USock.SendPing(ctx.MasterInfo.MasterAddr, ctx.PlayerID,
-		v.Engine.Peers.PeersInfo[ctx.MasterInfo.MasterAddr])
+	v.Engine.GameMtx.Lock()
+	masterAddr := v.Engine.GameCtx.MasterInfo.MasterAddr
+	senderId := v.Engine.GameCtx.PlayerID
+	v.Engine.GameMtx.Unlock()
+
+	v.Engine.PeerMtx.Lock()
+	peerInfo := v.Engine.Peers.PeersInfo[masterAddr]
+	v.Engine.PeerMtx.Unlock()
+
+	err := v.Engine.USock.SendPing(masterAddr, senderId, peerInfo, &v.Engine.PeerMtx)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
 func (v *Viewer) CheckTimeoutInteraction(interval, recvInterval int32) RolePlayer {
+	v.Engine.GameMtx.Lock()
 	masterInfo := v.Engine.GameCtx.MasterInfo
+	v.Engine.GameMtx.Unlock()
+
+	v.Engine.PeerMtx.Lock()
 	peerInfo := v.Engine.Peers.PeersInfo[masterInfo.MasterAddr]
+	v.Engine.PeerMtx.Unlock()
 
 	if peerInfo == nil {
 		return v
 	}
-	if !peerInfo.LastSend.IsZero() {
-		if time.Now().Sub(peerInfo.LastSend) >= time.Duration(interval)*time.Millisecond {
+
+	now := time.Now()
+
+	peerInfo.M.Lock()
+	if peerInfo.Dead {
+		peerInfo.M.Unlock()
+		return v
+	}
+	lastSend := peerInfo.LastSend
+	peerInfo.M.Unlock()
+
+	if !lastSend.IsZero() {
+		if now.Sub(lastSend) >= time.Duration(interval)*time.Millisecond {
 			fmt.Println("Master send timeout - SEND PING")
 			v.SendPingToMaster()
 		}
 	}
 
-	acks := peerInfo.Acknowledges.Acks
-	for _, ack := range acks {
+	peerInfo.M.Lock()
+	//acks := peerInfo.Acknowledges.Acks
+	acks := CopyPendingAcks(peerInfo.Acknowledges)
+	peerInfo.M.Unlock()
+
+	if acks == nil {
+		return v
+	}
+
+	for _, ack := range acks.Acks {
+		if ack == nil {
+			continue
+		}
 		if ack.SendTime.IsZero() {
 			continue
 		}
-		if time.Now().Sub(ack.SendTime) >= time.Duration(interval)*time.Millisecond {
+		if now.Sub(ack.SendTime) >= time.Duration(interval)*time.Millisecond {
 			fmt.Println("Master ack timeout - RETRY")
-			v.Engine.USock.SendMessage(ack.RequestMsg, masterInfo.MasterAddr, peerInfo)
+			err := v.Engine.USock.SendMessage(ack.RequestMsg, masterInfo.MasterAddr, peerInfo, &v.Engine.PeerMtx)
+			if err != nil {
+				fmt.Println("Send mes to master error:", err)
+			}
 		}
 	}
 
-	if !peerInfo.LastRecv.IsZero() {
-		if time.Now().Sub(peerInfo.LastRecv) >= time.Duration(recvInterval)*time.Millisecond {
+	peerInfo.M.Lock()
+	lastRecv := peerInfo.LastRecv
+	peerInfo.M.Unlock()
+
+	if !lastRecv.IsZero() {
+		if now.Sub(lastRecv) >= time.Duration(recvInterval)*time.Millisecond {
 			fmt.Println("Master recieve timeout - DISCONNECT")
-			v.Engine.GameCtx.MasterInfo = v.ChangeMasterInfo()
+			v.ChangeMasterInfo()
 		}
 	}
 	return v

@@ -12,8 +12,8 @@ import (
 type Normal struct {
 	Engine *Engine
 
-	lastSend time.Time
-	lastRecv time.Time
+	//lastSend time.Time
+	//lastRecv time.Time
 }
 
 func NewNormal(e *Engine) *Normal {
@@ -25,37 +25,57 @@ func (n *Normal) SetEngine(e *Engine) {
 }
 
 func (n *Normal) AddMasterInfo(addr string, id int32) {
-	n.Engine.Peers.PeersInfo[addr] = &transport.PeerInfo{
-		Acknowledges: &transport.PendingAcks{Acks: make(map[int64]*transport.PendingAckMsg)},
-		LastRecv:     time.Time{},
-		LastSend:     time.Time{},
-	}
+	//недостижимый кейс
+	//n.Engine.Peers.PeersInfo[addr] = &transport.PeerInfo{
+	//	Acknowledges: &transport.PendingAcks{Acks: make(map[int64]*transport.PendingAckMsg)},
+	//	LastRecv:     time.Time{},
+	//	LastSend:     time.Time{},
+	//}
+	n.Engine.GameMtx.Lock()
 	n.Engine.GameCtx.MasterInfo = domain.MasterInfo{
 		MasterAddr: addr,
 		MasterId:   id,
 	}
+	n.Engine.GameMtx.Unlock()
 }
 
 func (n *Normal) SetGameContext() {
+	n.Engine.GameMtx.Lock()
 	n.Engine.GameCtx = &domain.GameCtx{}
 	n.Engine.GameCtx.PlayerID = UninitializedId
 	n.Engine.GameCtx.PlayerName = "normal_name"
 	n.Engine.GameCtx.PlayerType = pb.PlayerType_HUMAN
 	n.Engine.GameCtx.Role = pb.NodeRole_NORMAL
 	n.Engine.GameCtx.StateMsDelay = DefaultStateMsDelay
+	n.Engine.GameMtx.Unlock()
 }
 
 func (n *Normal) SetId(id int32) {
+	n.Engine.GameMtx.Lock()
 	n.Engine.GameCtx.PlayerID = id
+	n.Engine.GameMtx.Unlock()
 }
 
 func (n *Normal) SendPingToMaster() {
+	n.Engine.GameMtx.Lock()
 	ctx := n.Engine.GameCtx
-	n.Engine.USock.SendPing(ctx.MasterInfo.MasterAddr, ctx.PlayerID,
-		n.Engine.Peers.PeersInfo[ctx.MasterInfo.MasterAddr])
+	masterAddr := ctx.MasterInfo.MasterAddr
+	senderId := ctx.PlayerID
+	n.Engine.GameMtx.Unlock()
+
+	n.Engine.PeerMtx.Lock()
+	peerInfo := n.Engine.Peers.PeersInfo[masterAddr]
+	n.Engine.PeerMtx.Unlock()
+
+	err := n.Engine.USock.SendPing(masterAddr, senderId, peerInfo, &n.Engine.PeerMtx)
+	if err != nil {
+		fmt.Println("send ping to master error:", err)
+	}
 }
 
 func (n *Normal) ChangeMasterInfo() domain.MasterInfo {
+	n.Engine.GameMtx.Lock()
+	defer n.Engine.GameMtx.Unlock()
 	ctx := n.Engine.GameCtx
 	ctx.MasterInfo.MasterId = ctx.DeputyInfo.DeputyId
 	ctx.MasterInfo.MasterAddr = ctx.DeputyInfo.DeputyAddr
@@ -82,7 +102,7 @@ func (n *Normal) HandleRoleChange(senderRole, receiverRole pb.NodeRole, peerInfo
 		case pb.NodeRole_NORMAL:
 			fmt.Println("New master!")
 			//о новом депути нормалы узнают из StateMsg
-			n.Engine.GameCtx.MasterInfo = n.ChangeMasterInfo()
+			n.ChangeMasterInfo()
 			return n
 		//назначение кого-то заместителем (receiver_role = DEPUTY)
 		case pb.NodeRole_DEPUTY:
@@ -120,36 +140,70 @@ func (n *Normal) StartNetTicker() {
 
 func (n *Normal) CheckTimeoutInteraction(interval, recvInterval int32) RolePlayer {
 	//fmt.Println("normal CheckTimeoutInteraction")
+
+	n.Engine.GameMtx.Lock()
 	masterInfo := n.Engine.GameCtx.MasterInfo
+	n.Engine.GameMtx.Unlock()
+
+	n.Engine.PeerMtx.Lock()
 	peerInfo := n.Engine.Peers.PeersInfo[masterInfo.MasterAddr]
+	n.Engine.PeerMtx.Unlock()
 
 	if peerInfo == nil {
 		fmt.Println("Master is nil")
 		return n
 	}
+
+	now := time.Now()
+
+	peerInfo.M.Lock()
+	if peerInfo.Dead {
+		peerInfo.M.Unlock()
+		return n
+	}
+	lastSend := peerInfo.LastSend
+	peerInfo.M.Unlock()
+
 	fmt.Println("Master not nil")
-	if !peerInfo.LastSend.IsZero() {
-		if time.Now().Sub(peerInfo.LastSend) >= time.Duration(interval)*time.Millisecond {
+	if !lastSend.IsZero() {
+		if now.Sub(lastSend) >= time.Duration(interval)*time.Millisecond {
 			fmt.Println("Master send timeout - SEND PING")
 			n.SendPingToMaster()
 		}
 	}
+	peerInfo.M.Lock()
+	//acks := peerInfo.Acknowledges.Acks
+	acks := CopyPendingAcks(peerInfo.Acknowledges)
+	peerInfo.M.Unlock()
 
-	acks := peerInfo.Acknowledges.Acks
-	for _, ack := range acks {
+	if acks == nil {
+		return n
+	}
+
+	for _, ack := range acks.Acks {
+		if ack == nil {
+			continue
+		}
 		if ack.SendTime.IsZero() {
 			continue
 		}
-		if time.Now().Sub(ack.SendTime) >= time.Duration(interval)*time.Millisecond {
+		if now.Sub(ack.SendTime) >= time.Duration(interval)*time.Millisecond {
 			fmt.Println("Master ack timeout - RETRY")
-			n.Engine.USock.SendMessage(ack.RequestMsg, masterInfo.MasterAddr, peerInfo)
+			err := n.Engine.USock.SendMessage(ack.RequestMsg, masterInfo.MasterAddr, peerInfo, &n.Engine.PeerMtx)
+			if err != nil {
+				fmt.Println("Send mes to master error:", err)
+			}
 		}
 	}
 
-	if !peerInfo.LastRecv.IsZero() {
-		if time.Now().Sub(peerInfo.LastRecv) >= time.Duration(recvInterval)*time.Millisecond {
+	peerInfo.M.Lock()
+	lastRecv := peerInfo.LastRecv
+	peerInfo.M.Unlock()
+
+	if !lastRecv.IsZero() {
+		if now.Sub(lastRecv) >= time.Duration(recvInterval)*time.Millisecond {
 			fmt.Println("Master recieve timeout - DISCONNECT")
-			n.Engine.GameCtx.MasterInfo = n.ChangeMasterInfo()
+			n.ChangeMasterInfo()
 		}
 	}
 	return n

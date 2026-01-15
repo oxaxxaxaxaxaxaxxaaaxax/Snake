@@ -18,18 +18,18 @@ type MulticastSocket struct {
 	Conn net.UDPConn
 }
 
-func NewMulticastSocket() MulticastSocket {
+func NewMulticastSocket() (MulticastSocket, error) {
 	address := fmt.Sprintf("%v:%v", Addr, Port)
 	sockAddr, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
-		return MulticastSocket{}
+		return MulticastSocket{}, err
 	}
 	conn, err := net.ListenMulticastUDP("udp", nil, sockAddr)
 	if err != nil {
-		return MulticastSocket{}
+		return MulticastSocket{}, err
 	}
 	fmt.Println("MulticastSocket created")
-	return MulticastSocket{Conn: *conn}
+	return MulticastSocket{Conn: *conn}, nil
 }
 
 func (m MulticastSocket) ReadFromMulticastSocket(evChan chan domain.Event) {
